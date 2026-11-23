@@ -4,7 +4,9 @@
 #   2. uniform and frequency-aware training, identical except for the sampler
 #   3. dev evaluation: greedy plus several sampling seeds per model, and the
 #      untuned FLAN-T5-base baseline
-#   4. one comparison table
+#   4. event-level diversity: K samples per rare condition tuple per model,
+#      compared with K real training narratives and with retrieval
+#   5. one comparison table
 #
 # Usage, from the repository root:
 #   bash scripts/gpu_run.sh
@@ -34,6 +36,7 @@ BF16=${BF16:-auto}            # auto: on if the GPU supports bfloat16
 REQUIRE_CUDA=${REQUIRE_CUDA:-1}
 DEV_LIMIT=${DEV_LIMIT:-0}     # dev records scored during training; 0 = all
 EVAL_LIMIT=${EVAL_LIMIT:-0}   # dev records generated in evaluation; 0 = all
+DIVERSITY_LIMIT=${DIVERSITY_LIMIT:-0}  # rare tuples in the diversity stage; 0 = all 156
 
 log() { printf '\n== %s  %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
@@ -101,6 +104,18 @@ done
 evaluate untuned-greedy "$MODEL" --revision "$REVISION" --decoding greedy
 RUNS+=("untuned-greedy=$OUT/eval/untuned-greedy")
 
+for MODE in uniform frequency-aware; do
+    DIR="$OUT/diversity/$MODE"
+    if [ -f "$DIR/summary.json" ]; then log "diversity $MODE: done, skipping"; continue; fi
+    log "diversity $MODE"
+    mkdir -p "$OUT/diversity"
+    "$PY" -m rarecrash.diversity --data data/processed --model "$OUT/train-$MODE/model" \
+        --out "$DIR" --k 5 --seed "$SEED" --limit-tuples "$DIVERSITY_LIMIT" \
+        > "$DIR.log" 2>&1 || { tail -20 "$DIR.log"; exit 1; }
+done
+
 log "comparison"
 "$PY" -m rarecrash.compare --runs "${RUNS[@]}" --out "$OUT/comparison.md"
+"$PY" -m rarecrash.compare --diversity --runs uniform="$OUT/diversity/uniform" \
+    frequency-aware="$OUT/diversity/frequency-aware" | tee -a "$OUT/comparison.md"
 log "done: results in $OUT (comparison.md, train-*/run.json, eval/*/summary.json)"

@@ -7,6 +7,11 @@ read from the first run, since it is identical in every run.
     python -m rarecrash.compare --runs uniform-sample=runs/gpu/eval/uniform-s1 \\
         uniform-sample=runs/gpu/eval/uniform-s2 frequency-greedy=runs/gpu/eval/freq-greedy \\
         --out runs/gpu/comparison.md
+
+With --diversity, PATH holds a `rarecrash.diversity` summary.json instead,
+and the table compares event-level diversity on rare condition tuples.
+
+    python -m rarecrash.compare --diversity --runs uniform=runs/gpu/diversity/uniform
 """
 
 import argparse
@@ -23,6 +28,44 @@ METRICS = [
     ("distinct_2", "distinct-2"),
     ("copied_from_train_rate", "copied"),
 ]
+
+
+DIVERSITY_METRICS = [
+    ("mean_distinct_signatures_per_tuple", "distinct event signatures / tuple"),
+    ("mean_distinct_valid_signatures_per_tuple", "distinct signatures / tuple, valid samples only"),
+    ("valid_sample_rate", "valid samples"),
+    ("tuples_with_multiple_signatures", "tuples with >1 signature"),
+    ("all_fields_adherence", "adherence"),
+    ("vehicle_count_consistency", "vehicle-count consistent"),
+    ("event_parse_rate", "event fields parsed"),
+    ("copied_from_train_rate", "copied"),
+    ("novel_signature_given_conditions_rate", "signature new for these conditions"),
+    ("novel_signature_anywhere_rate", "signature new anywhere"),
+]
+
+
+def diversity_table(runs):
+    """Rows: metrics; columns: reference, retrieval, then each model run."""
+    columns = {}
+    for label, path in runs:
+        summary = json.loads((path / "summary.json").read_text())
+        if not columns:
+            columns["reference (real)"] = summary["results"]["reference"]
+            columns["retrieval"] = summary["results"]["retrieval"]
+        columns[label] = summary["results"]["model"]
+    k = next(iter(columns.values()))["samples_per_tuple"]
+    header = ["metric", *columns]
+    lines = [f"### Event-level diversity on rare condition tuples ({k} outputs per tuple)", "",
+             "| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    rows = [(key, name, lambda r, key=key: r[key]) for key, name in DIVERSITY_METRICS]
+    fields = next(iter(columns.values()))["field_variation"]
+    rows += [(f, f"varies: {f}", lambda r, f=f: r["field_variation"][f]) for f in fields]
+    for _, name, get in rows:
+        lines.append("| " + " | ".join([name, *(f"{get(r):.3f}" if get(r) is not None else "n/a"
+                                                 for r in columns.values())]) + " |")
+    lines.append("\n'varies' is the share of tuples in which that event field takes more than "
+                 "one value. Reference rows are real training narratives for the same tuples.\n")
+    return "\n".join(lines)
 
 
 def parse_run(spec):
@@ -56,7 +99,17 @@ def main():
     parser.add_argument("--runs", nargs="+", type=parse_run, required=True,
                         help="LABEL=PATH pairs; PATH holds an evaluate summary.json")
     parser.add_argument("--out", help="write the Markdown tables here as well")
+    parser.add_argument("--diversity", action="store_true",
+                        help="runs are rarecrash.diversity outputs")
     args = parser.parse_args()
+
+    if args.diversity:
+        text = diversity_table(args.runs)
+        if args.out:
+            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.out).write_text(text, encoding="utf-8")
+        print(text)
+        return
 
     groups = defaultdict(list)
     scope = None
