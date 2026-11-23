@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 import unittest
 
-from rarecrash.compare import fmt, parse_run, table
+from rarecrash.compare import bootstrap_ci, fmt, parse_run, table
 
 
 class CompareTests(unittest.TestCase):
@@ -21,6 +21,18 @@ class CompareTests(unittest.TestCase):
         lines = table({"retrieval": [result], "model": [result, result]}, "all").splitlines()
         self.assertEqual(len(lines), 4)
         self.assertIn("| model | 2 | 1.000 ± 0.000 |", lines[3])
+
+    def test_bootstrap_ci(self):
+        values = [0.0] * 50 + [1.0] * 50
+        lo, hi = bootstrap_ci(values, 500)
+        self.assertLess(lo, 0.5)
+        self.assertGreater(hi, 0.5)
+        self.assertLess(hi - lo, 0.4)
+        self.assertEqual((lo, hi), bootstrap_ci(values, 500))  # seeded
+        c = bootstrap_ci([0.25] * 10, 100)
+        self.assertAlmostEqual(c[0], 0.25)
+        self.assertAlmostEqual(c[1], 0.25)
+        self.assertIsNone(bootstrap_ci([], 100))
 
 
 if __name__ == "__main__":

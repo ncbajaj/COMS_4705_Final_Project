@@ -26,6 +26,7 @@ import re
 
 from .pipeline import (CONDITION_FIELDS, condition_key, is_rare_count, load_jsonl,
                        parse_conditions, write_json)
+from .scenario import target_text
 from .train import choose_device, prompt
 
 
@@ -62,11 +63,11 @@ def distinct_n(texts, n):
     return len(set(grams)) / len(grams) if grams else None
 
 
-def retrieval_outputs(train, dev):
+def retrieval_outputs(train, dev, scenario=False):
     """Same rule as `rarecrash retrieve`: the first training narrative per tuple."""
     pool = {}
     for record in train:
-        pool.setdefault(condition_key(record), record["target"])
+        pool.setdefault(condition_key(record), target_text(record, scenario))
     return {r["id"]: pool.get(condition_key(r)) for r in dev}
 
 
@@ -84,7 +85,7 @@ def field_matches(field, parsed, expected):
     return parsed == expected
 
 
-def score_row(record, output, train_targets):
+def score_row(record, output, train_targets, scenario=False):
     if output is None:
         return {"has_output": False, "fields_correct": dict.fromkeys(CONDITION_FIELDS, False),
                 "all_fields_correct": False, "rouge_l": 0.0, "copied_from_train": False}
@@ -92,7 +93,7 @@ def score_row(record, output, train_targets):
     correct = {f: field_matches(f, parsed[f], record[f]) for f in CONDITION_FIELDS}
     return {"has_output": True, "parsed": parsed, "fields_correct": correct,
             "all_fields_correct": all(correct.values()),
-            "rouge_l": rouge_l_f1(output, record["target"]),
+            "rouge_l": rouge_l_f1(output, target_text(record, scenario)),
             "copied_from_train": normalize(output) in train_targets}
 
 
@@ -178,6 +179,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=4705)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    parser.add_argument("--scenario-sentence", action="store_true",
+                        help="score against targets that include the scenario sentence")
     args = parser.parse_args()
     if args.limit < 0 or args.batch_size < 1 or args.max_new_tokens < 1:
         parser.error("limit must be nonnegative; batch-size and max-new-tokens positive")
@@ -194,9 +197,10 @@ def main():
     if not dev:
         raise ValueError("No development records selected")
 
-    train_targets = {normalize(r["target"]) for r in train}
+    train_targets = {normalize(target_text(r, args.scenario_sentence)) for r in train}
     model_outputs, runtime = generate(args, dev)
-    systems = {"model": model_outputs, "retrieval": retrieval_outputs(train, dev)}
+    systems = {"model": model_outputs,
+               "retrieval": retrieval_outputs(train, dev, args.scenario_sentence)}
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -205,12 +209,13 @@ def main():
         for record in dev:
             for name, outputs in systems.items():
                 row = {"record": record, "output": outputs[record["id"]]}
-                row["score"] = score_row(record, row["output"], train_targets)
+                row["score"] = score_row(record, row["output"], train_targets,
+                                         args.scenario_sentence)
                 rows[name].append(row)
                 f.write(json.dumps({
                     "id": record["id"], "system": name, "rare": record["id"] in rare_ids,
                     "conditions": {k: record[k] for k in CONDITION_FIELDS},
-                    "output": row["output"], "reference": record["target"], **row["score"],
+                    "output": row["output"], "reference": target_text(record, args.scenario_sentence), **row["score"],
                 }) + "\n")
 
     run_info = Path(args.model).parent / "run.json" if Path(args.model).is_dir() else None
@@ -219,6 +224,7 @@ def main():
         "model": str(args.model),
         "training_run": json.loads(run_info.read_text()) if run_info and run_info.exists() else None,
         "subset": args.subset, "limit": args.limit, "seed": args.seed,
+        "scenario_sentence": args.scenario_sentence,
         **runtime,
         "results": {
             name: {"all": summarize(sys_rows),

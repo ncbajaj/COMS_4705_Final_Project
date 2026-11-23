@@ -2,7 +2,7 @@ import unittest
 from collections import Counter
 
 from rarecrash.pipeline import condition_key
-from rarecrash.train import CheckpointSelector, dev_subsets, eval_steps
+from rarecrash.train import CheckpointSelector, dev_subsets, eval_steps, rare_mass, sampling_weights
 
 
 def record(crash_id, cause):
@@ -16,6 +16,27 @@ class EvalStepsTests(unittest.TestCase):
 
     def test_includes_last_step_when_not_a_multiple(self):
         self.assertEqual(eval_steps(10, 4), {4, 8, 10})
+
+
+class SamplingWeightTests(unittest.TestCase):
+    def test_alpha_values(self):
+        self.assertEqual(sampling_weights([1, 4, 100], 0), [1.0, 1.0, 1.0])
+        self.assertEqual(sampling_weights([1, 4, 100], 0.5), [1.0, 0.5, 0.1])
+        self.assertEqual(sampling_weights([1, 4, 100], 1.0), [1.0, 0.25, 0.01])
+
+    def test_alpha_one_balances_tuples(self):
+        counts = [2, 2, 5, 5, 5, 5, 5]
+        w = sampling_weights(counts, 1.0)
+        self.assertAlmostEqual(sum(x for n, x in zip(counts, w) if n == 2),
+                               sum(x for n, x in zip(counts, w) if n == 5))
+
+    def test_zero_count_treated_as_one(self):
+        self.assertEqual(sampling_weights([0], 0.5), [1.0])
+
+    def test_rare_mass(self):
+        counts = [5, 100, 100, 100]
+        self.assertAlmostEqual(rare_mass(counts), 0.25)
+        self.assertGreater(rare_mass(counts, sampling_weights(counts, 0.5)), 0.25)
 
 
 class CheckpointSelectorTests(unittest.TestCase):

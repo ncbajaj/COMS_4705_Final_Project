@@ -1,6 +1,7 @@
 import unittest
 
-from rarecrash.review import cohen_kappa, parse_preference, parse_rating, sample_items, unblind
+from rarecrash.review import (cohen_kappa, parse_details, parse_preference, parse_yes_no,
+                              sample_items, sheet_fields, unblind)
 
 
 def prediction(crash_id, system, surface="wet", rare=True, output="text"):
@@ -33,23 +34,48 @@ class SampleItemsTests(unittest.TestCase):
 
 class ScoringTests(unittest.TestCase):
     def test_parsers(self):
-        self.assertEqual(parse_rating(" 4 "), 4)
-        self.assertIsNone(parse_rating(""))
+        for v in ("yes", "Y", "1", "TRUE", " true "):
+            self.assertIs(parse_yes_no(v), True)
+        for v in ("no", "N", "0", "False"):
+            self.assertIs(parse_yes_no(v), False)
+        self.assertIsNone(parse_yes_no(""))
+        self.assertIsNone(parse_yes_no(None))
         with self.assertRaises(ValueError):
-            parse_rating("6")
+            parse_yes_no("maybe")
+        for v, want in (("coherent", "coherent"), ("C", "coherent"), ("IC", "contradictory"),
+                        ("Contradictory", "contradictory"), ("imp", "implausible"),
+                        ("Implausible", "implausible")):
+            self.assertEqual(parse_details(v), want)
+        self.assertIsNone(parse_details(" "))
+        for bad in ("i", "x", "fine"):
+            with self.assertRaises(ValueError):
+                parse_details(bad)
         self.assertEqual(parse_preference("b"), "B")
         self.assertEqual(parse_preference("Tie"), "tie")
         with self.assertRaises(ValueError):
             parse_preference("model")
 
+    def test_sheet_columns(self):
+        self.assertEqual(sheet_fields(), [
+            "item", "surface", "lighting", "vehicles", "primary_cause", "output_A", "output_B",
+            "A_condition_contradiction", "A_details", "B_condition_contradiction", "B_details",
+            "preference", "notes"])
+
     def test_unblind_maps_sides_to_systems(self):
         key = {"1": {"A": "retrieval", "B": "model"}}
-        row = {"item": "1", "A_fluency": "2", "B_fluency": "5", "preference": "B"}
+        row = {"item": "1", "A_condition_contradiction": "yes", "A_details": "imp",
+               "B_condition_contradiction": "n", "B_details": "", "preference": "B"}
         judged = unblind([row], key)["1"]
         self.assertEqual(judged["preference"], "model")
-        self.assertEqual(judged["ratings"]["model"]["fluency"], 5)
-        self.assertEqual(judged["ratings"]["retrieval"]["fluency"], 2)
-        self.assertIsNone(judged["ratings"]["model"]["plausibility"])
+        self.assertIs(judged["condition_contradiction"]["retrieval"], True)
+        self.assertIs(judged["condition_contradiction"]["model"], False)
+        self.assertEqual(judged["details"]["retrieval"], "implausible")
+        self.assertIsNone(judged["details"]["model"])
+
+    def test_unblind_rejects_bad_label(self):
+        key = {"1": {"A": "model", "B": "retrieval"}}
+        with self.assertRaises(ValueError):
+            unblind([{"item": "1", "A_details": "great"}], key)
 
     def test_cohen_kappa(self):
         self.assertEqual(cohen_kappa(["a", "b", "a"], ["a", "b", "a"]), 1.0)

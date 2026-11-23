@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # Full FLAN-T5-base experiment on one GPU machine, from a fresh clone:
 #   1. environment and data (the split is checked against the milestone numbers)
-#   2. uniform and frequency-aware training, identical except for the sampler
+#   2. uniform and frequency-aware training for each of TRAIN_SEEDS, identical
+#      except for the sampler (ALPHA sets the frequency-aware exponent)
 #   3. dev evaluation: greedy plus several sampling seeds per model, and the
-#      untuned FLAN-T5-base baseline
+#      untuned FLAN-T5-base control (label control-untuned)
 #   4. event-level diversity: K samples per rare condition tuple per model,
 #      compared with K real training narratives and with retrieval
-#   5. one comparison table
+#   5. one comparison table (mean ± sd over training and sampling seeds,
+#      plus bootstrap CIs on the rare slice)
 #
 # Usage, from the repository root:
 #   bash scripts/gpu_run.sh
@@ -22,14 +24,16 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PYTHON=${PYTHON:-python3}
-OUT=${OUT:-runs/gpu}
+SCENARIO=${SCENARIO:-0}       # 1: targets include the collision-type scenario sentence
+if [ "$SCENARIO" = 1 ]; then OUT=${OUT:-runs/gpu-scenario}; else OUT=${OUT:-runs/gpu}; fi
 MODEL=${MODEL:-google/flan-t5-base}
 REVISION=${REVISION:-7bcac572ce56db69c1ea7c8af255c5d7c9672fc2}  # flan-t5-base, resolved 2026-11-23
 STEPS=${STEPS:-3000}          # about 5 epochs of the 9,625 training records at batch 16
 BATCH=${BATCH:-16}
 LR=${LR:-3e-4}
 EVAL_EVERY=${EVAL_EVERY:-250}
-SEED=${SEED:-4705}
+TRAIN_SEEDS=${TRAIN_SEEDS:-"4705 4706 4707"}  # one training run per mode per seed
+ALPHA=${ALPHA:-0.5}           # frequency-aware weight = count ** -ALPHA
 SAMPLE_SEEDS=${SAMPLE_SEEDS:-"1 2 3"}
 BF16=${BF16:-auto}            # auto: on if the GPU supports bfloat16
 # Smoke-test overrides only; leave at their defaults for the real run.
@@ -54,6 +58,9 @@ if [ "$BF16" = auto ]; then
 fi
 BF16_FLAG=(); if [ "$BF16" = 1 ]; then BF16_FLAG=(--bf16); fi
 echo "bf16: $BF16"
+SC_FLAG=(); SC_DIV_FLAG=()
+if [ "$SCENARIO" = 1 ]; then SC_FLAG=(--scenario-sentence); SC_DIV_FLAG=(--scenario); fi
+echo "scenario sentence: $SCENARIO (results in $OUT)"
 
 log "data"
 mkdir -p data "$OUT"
@@ -71,15 +78,23 @@ print("split matches milestone:", got)
 EOF
 [ -f "$OUT/retrieval_baseline.json" ] || "$PY" -m rarecrash retrieve --data data/processed --out "$OUT/retrieval_baseline.json" >/dev/null
 
-for MODE in uniform frequency-aware; do
-    DIR="$OUT/train-$MODE"
-    if [ -f "$DIR/run.json" ]; then log "train $MODE: done, skipping"; continue; fi
-    log "train $MODE"
-    "$PY" -m rarecrash.train --data data/processed --out "$DIR" \
-        --model "$MODEL" --revision "$REVISION" --mode "$MODE" \
-        --limit 0 --steps "$STEPS" --batch-size "$BATCH" --lr "$LR" --seed "$SEED" \
-        --eval-every "$EVAL_EVERY" --dev-limit "$DEV_LIMIT" --eval-batch-size 32 --select-on dev \
-        --save-model ${BF16_FLAG[@]+"${BF16_FLAG[@]}"} 2>&1 | tee "$DIR.log"
+ALPHA_FLAG=(--sampling-alpha "$ALPHA")
+
+for SEED in $TRAIN_SEEDS; do
+    for MODE in uniform frequency-aware; do
+        DIR="$OUT/train-$MODE-s$SEED"
+        if [ -f "$DIR/run.json" ]; then log "train $MODE seed $SEED: done, skipping"; continue; fi
+        log "train $MODE seed $SEED"
+        EXTRA=(); if [ "$MODE" = frequency-aware ]; then EXTRA=("${ALPHA_FLAG[@]}"); fi
+        mkdir -p "$OUT"
+        "$PY" -m rarecrash.train --data data/processed --out "$DIR" \
+            --model "$MODEL" --revision "$REVISION" --mode "$MODE" \
+            ${EXTRA[@]+"${EXTRA[@]}"} \
+            --limit 0 --steps "$STEPS" --batch-size "$BATCH" --lr "$LR" --seed "$SEED" \
+            --eval-every "$EVAL_EVERY" --dev-limit "$DEV_LIMIT" --eval-batch-size 32 --select-on dev \
+            --save-model ${BF16_FLAG[@]+"${BF16_FLAG[@]}"} ${SC_FLAG[@]+"${SC_FLAG[@]}"} \
+            2>&1 | tee "$DIR.log"
+    done
 done
 
 evaluate() {  # label, model, extra args...
@@ -88,34 +103,40 @@ evaluate() {  # label, model, extra args...
     if [ -f "$dir/summary.json" ]; then log "eval $label: done, skipping"; return; fi
     log "eval $label"
     "$PY" -m rarecrash.evaluate --data data/processed --model "$model" --out "$dir" \
-        --batch-size 32 --limit "$EVAL_LIMIT" "$@" > "$dir.log" 2>&1 || { tail -20 "$dir.log"; exit 1; }
+        --batch-size 32 --limit "$EVAL_LIMIT" ${SC_FLAG[@]+"${SC_FLAG[@]}"} "$@" > "$dir.log" 2>&1 || { tail -20 "$dir.log"; exit 1; }
 }
 
-mkdir -p "$OUT/eval"
+mkdir -p "$OUT/eval" "$OUT/diversity"
 RUNS=()
-for MODE in uniform frequency-aware; do
-    evaluate "$MODE-greedy" "$OUT/train-$MODE/model" --decoding greedy
-    RUNS+=("$MODE-greedy=$OUT/eval/$MODE-greedy")
-    for S in $SAMPLE_SEEDS; do
-        evaluate "$MODE-sample-s$S" "$OUT/train-$MODE/model" --decoding sample --seed "$S"
-        RUNS+=("$MODE-sample=$OUT/eval/$MODE-sample-s$S")
+DRUNS=()
+for SEED in $TRAIN_SEEDS; do
+    for MODE in uniform frequency-aware; do
+        MODEL_DIR="$OUT/train-$MODE-s$SEED/model"
+        evaluate "$MODE-s$SEED-greedy" "$MODEL_DIR" --decoding greedy
+        RUNS+=("$MODE-greedy=$OUT/eval/$MODE-s$SEED-greedy")
+        for S in $SAMPLE_SEEDS; do
+            evaluate "$MODE-s$SEED-sample-s$S" "$MODEL_DIR" --decoding sample --seed "$S"
+            RUNS+=("$MODE-sample=$OUT/eval/$MODE-s$SEED-sample-s$S")
+        done
     done
 done
-evaluate untuned-greedy "$MODEL" --revision "$REVISION" --decoding greedy
-RUNS+=("untuned-greedy=$OUT/eval/untuned-greedy")
+evaluate control-untuned "$MODEL" --revision "$REVISION" --decoding greedy
+RUNS+=("control-untuned=$OUT/eval/control-untuned")
 
-for MODE in uniform frequency-aware; do
-    DIR="$OUT/diversity/$MODE"
-    if [ -f "$DIR/summary.json" ]; then log "diversity $MODE: done, skipping"; continue; fi
-    log "diversity $MODE"
-    mkdir -p "$OUT/diversity"
-    "$PY" -m rarecrash.diversity --data data/processed --model "$OUT/train-$MODE/model" \
-        --out "$DIR" --k 5 --seed "$SEED" --limit-tuples "$DIVERSITY_LIMIT" \
-        > "$DIR.log" 2>&1 || { tail -20 "$DIR.log"; exit 1; }
+for SEED in $TRAIN_SEEDS; do
+    for MODE in uniform frequency-aware; do
+        DIR="$OUT/diversity/$MODE-s$SEED"
+        DRUNS+=("$MODE=$DIR")
+        if [ -f "$DIR/summary.json" ]; then log "diversity $MODE seed $SEED: done, skipping"; continue; fi
+        log "diversity $MODE seed $SEED"
+        "$PY" -m rarecrash.diversity --data data/processed --model "$OUT/train-$MODE-s$SEED/model" \
+            --out "$DIR" --k 5 --seed "$SEED" --limit-tuples "$DIVERSITY_LIMIT" \
+            ${SC_DIV_FLAG[@]+"${SC_DIV_FLAG[@]}"} \
+            > "$DIR.log" 2>&1 || { tail -20 "$DIR.log"; exit 1; }
+    done
 done
 
 log "comparison"
-"$PY" -m rarecrash.compare --runs "${RUNS[@]}" --out "$OUT/comparison.md"
-"$PY" -m rarecrash.compare --diversity --runs uniform="$OUT/diversity/uniform" \
-    frequency-aware="$OUT/diversity/frequency-aware" | tee -a "$OUT/comparison.md"
+"$PY" -m rarecrash.compare --bootstrap 1000 --runs "${RUNS[@]}" --out "$OUT/comparison.md"
+"$PY" -m rarecrash.compare --diversity --runs "${DRUNS[@]}" | tee -a "$OUT/comparison.md"
 log "done: results in $OUT (comparison.md, train-*/run.json, eval/*/summary.json)"

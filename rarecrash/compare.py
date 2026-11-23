@@ -17,6 +17,7 @@ and the table compares event-level diversity on rare condition tuples.
 import argparse
 from collections import defaultdict
 import json
+import random
 from pathlib import Path
 import statistics
 
@@ -45,26 +46,74 @@ DIVERSITY_METRICS = [
 
 
 def diversity_table(runs):
-    """Rows: metrics; columns: reference, retrieval, then each model run."""
-    columns = {}
+    """Rows: metrics; columns: reference, retrieval, then each label.
+
+    Runs sharing a label (e.g. several training seeds) are reported as mean ± sd.
+    Reference and retrieval columns come from the first run.
+    """
+    grouped = defaultdict(list)
+    first = None
     for label, path in runs:
         summary = json.loads((path / "summary.json").read_text())
-        if not columns:
-            columns["reference (real)"] = summary["results"]["reference"]
-            columns["retrieval"] = summary["results"]["retrieval"]
-        columns[label] = summary["results"]["model"]
-    k = next(iter(columns.values()))["samples_per_tuple"]
+        first = first or summary
+        grouped[label].append(summary["results"]["model"])
+    columns = {"reference (real)": [first["results"]["reference"]],
+               "retrieval": [first["results"]["retrieval"]], **grouped}
+    k = first["results"]["reference"]["samples_per_tuple"]
     header = ["metric", *columns]
     lines = [f"### Event-level diversity on rare condition tuples ({k} outputs per tuple)", "",
              "| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
-    rows = [(key, name, lambda r, key=key: r[key]) for key, name in DIVERSITY_METRICS]
-    fields = next(iter(columns.values()))["field_variation"]
-    rows += [(f, f"varies: {f}", lambda r, f=f: r["field_variation"][f]) for f in fields]
-    for _, name, get in rows:
-        lines.append("| " + " | ".join([name, *(f"{get(r):.3f}" if get(r) is not None else "n/a"
-                                                 for r in columns.values())]) + " |")
+    rows = [(name, lambda r, key=key: r[key]) for key, name in DIVERSITY_METRICS]
+    fields = first["results"]["reference"]["field_variation"]
+    rows += [(f"varies: {f}", lambda r, f=f: r["field_variation"][f]) for f in fields]
+    for name, get in rows:
+        lines.append("| " + " | ".join([name, *(fmt([get(r) for r in rs])
+                                                 for rs in columns.values())]) + " |")
     lines.append("\n'varies' is the share of tuples in which that event field takes more than "
-                 "one value. Reference rows are real training narratives for the same tuples.\n")
+                 "one value. Reference rows are real training narratives for the same tuples. "
+                 "Columns with several runs show mean ± standard deviation across runs.\n")
+    return "\n".join(lines)
+
+
+def bootstrap_ci(values, n_boot, seed=4705, level=0.95):
+    """Percentile bootstrap CI of the mean, resampling values with replacement."""
+    if not values:
+        return None
+    rng = random.Random(seed)
+    n = len(values)
+    means = sorted(sum(values[rng.randrange(n)] for _ in range(n)) / n for _ in range(n_boot))
+    lo = means[int((1 - level) / 2 * n_boot)]
+    hi = means[min(n_boot - 1, int((1 + level) / 2 * n_boot))]
+    return lo, hi
+
+
+def per_record_scores(paths, system):
+    """{id: [adherence, rouge_l]} on rare records, averaged over the runs in paths."""
+    acc = defaultdict(list)
+    for path in paths:
+        with (path / "predictions.jsonl").open(encoding="utf-8") as f:
+            for line in f:
+                row = json.loads(line)
+                if row["system"] == system and row["rare"]:
+                    acc[row["id"]].append((float(row["all_fields_correct"]), row["rouge_l"]))
+    return {i: [sum(v[j] for v in vs) / len(vs) for j in (0, 1)] for i, vs in acc.items()}
+
+
+def bootstrap_table(label_paths, n_boot, seed=4705):
+    """label_paths: {label: (system, [run dirs])}."""
+    lines = [f"### Rare-tuple development records: mean and 95% bootstrap CI ({n_boot} resamples of "
+             "dev records)", "", "| system | records | adherence | ROUGE-L |", "|---|---|---|---|"]
+    for label, (system, paths) in label_paths.items():
+        scores = [v for _, v in sorted(per_record_scores(paths, system).items())]
+        if not scores:
+            lines.append(f"| {label} | 0 | n/a | n/a |")
+            continue
+        cells = []
+        for j in (0, 1):
+            col = [v[j] for v in scores]
+            lo, hi = bootstrap_ci(col, n_boot, seed)
+            cells.append(f"{sum(col) / len(col):.3f} [{lo:.3f}, {hi:.3f}]")
+        lines.append(f"| {label} | {len(scores)} | {cells[0]} | {cells[1]} |")
     return "\n".join(lines)
 
 
@@ -99,6 +148,8 @@ def main():
     parser.add_argument("--runs", nargs="+", type=parse_run, required=True,
                         help="LABEL=PATH pairs; PATH holds an evaluate summary.json")
     parser.add_argument("--out", help="write the Markdown tables here as well")
+    parser.add_argument("--bootstrap", type=int, default=0,
+                        help="resamples for 95%% CIs on the rare-tuple slice; 0 disables")
     parser.add_argument("--diversity", action="store_true",
                         help="runs are rarecrash.diversity outputs")
     args = parser.parse_args()
@@ -112,6 +163,7 @@ def main():
         return
 
     groups = defaultdict(list)
+    label_paths = {}
     scope = None
     for label, path in args.runs:
         summary = json.loads((path / "summary.json").read_text())
@@ -123,11 +175,15 @@ def main():
                          f"scored {scope}; compare runs on the same dev records only")
         if not groups:
             groups["retrieval"].append(summary["results"]["retrieval"])
+            label_paths["retrieval"] = ("retrieval", [path])
         groups[label].append(summary["results"]["model"])
+        label_paths.setdefault(label, ("model", []))[1].append(path)
 
     text = "\n\n".join(f"### {title}\n\n{table(groups, subset)}" for subset, title in
                        (("all", "All development records"),
                         ("rare_5_to_20", "Rare-tuple development records (5-20 training examples)")))
+    if args.bootstrap > 0:
+        text += "\n\n" + bootstrap_table(label_paths, args.bootstrap)
     text += ("\n\nMean ± standard deviation across runs with the same label (sampling seeds). "
              "Development data only.\n")
     if args.out:

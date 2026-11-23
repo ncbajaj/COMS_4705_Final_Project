@@ -27,6 +27,7 @@ import sys
 import time
 
 from .pipeline import condition_key, is_rare_count, load_jsonl, write_json
+from .scenario import target_text
 
 
 def prompt(record):
@@ -50,6 +51,22 @@ def dev_subsets(dev, full_train_counts, limit):
     rare = [r for r in ordered if is_rare_count(full_train_counts.get(condition_key(r), 0))]
     cap = (lambda rows: rows[:limit]) if limit else (lambda rows: rows)
     return {"dev": cap(ordered), "rare-dev": cap(rare)}
+
+
+def sampling_weights(counts, alpha):
+    """Per-example sampling weight count ** -alpha (counts below 1 are treated as 1).
+
+    alpha=0 is uniform, 0.5 is inverse-square-root frequency, 1.0 gives every
+    condition tuple equal total probability.
+    """
+    return [1 / max(1, n) ** alpha for n in counts]
+
+
+def rare_mass(counts, weights=None):
+    """Share of sampling probability on examples whose tuple count is rare."""
+    weights = weights if weights is not None else [1.0] * len(counts)
+    total = sum(weights)
+    return sum(w for n, w in zip(counts, weights) if is_rare_count(n)) / total if total else 0.0
 
 
 class CheckpointSelector:
@@ -124,6 +141,9 @@ def main():
     parser.add_argument("--model", default="google/flan-t5-small")
     parser.add_argument("--revision", default="main")
     parser.add_argument("--mode", choices=["uniform", "frequency-aware"], default="uniform")
+    parser.add_argument("--sampling-alpha", type=float, default=0.5,
+                        help="frequency-aware weight is count ** -alpha (0 = uniform, 1 = balance "
+                             "tuples); ignored with --mode uniform")
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--limit", type=int, default=64, help="0 means all training records")
@@ -144,11 +164,15 @@ def main():
     parser.add_argument("--max-target-tokens", type=int, default=192)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
     parser.add_argument("--save-model", action="store_true")
+    parser.add_argument("--scenario-sentence", action="store_true",
+                        help="add the collision-type scenario sentence to targets (see scenario.py)")
     parser.add_argument("--bf16", action="store_true",
                         help="bfloat16 autocast on CUDA (Ampere or newer); weights stay fp32")
     args = parser.parse_args()
     if args.steps < 1 or args.batch_size < 1 or args.eval_batch_size < 1:
         parser.error("steps, batch-size and eval-batch-size must be positive")
+    if args.sampling_alpha < 0:
+        parser.error("sampling-alpha must be nonnegative")
     if args.dev_limit < 0 or args.eval_every < 0 or args.patience < 0 or args.min_delta < 0:
         parser.error("dev-limit, eval-every, patience and min-delta must be nonnegative")
 
@@ -178,7 +202,13 @@ def main():
     subsets = dev_subsets(dev, full_train_counts, args.dev_limit)
     if not subsets[args.select_on]:
         raise ValueError(f"No development records in selection subset {args.select_on!r}")
-    weights = [1 / max(1, full_train_counts[condition_key(r)]) ** 0.5 for r in train]
+    train_counts = [full_train_counts[condition_key(r)] for r in train]
+    weights = sampling_weights(train_counts, args.sampling_alpha)
+    effective_alpha = args.sampling_alpha if args.mode == "frequency-aware" else 0.0
+    sampling = {"alpha": effective_alpha,
+                "rare_mass_uniform": rare_mass(train_counts),
+                "rare_mass_effective": rare_mass(
+                    train_counts, weights if args.mode == "frequency-aware" else None)}
     device = choose_device(torch, args.device)
     if args.bf16 and not (device == "cuda" and torch.cuda.is_bf16_supported()):
         parser.error("--bf16 needs a CUDA GPU with bfloat16 support")
@@ -198,7 +228,7 @@ def main():
             max_length=args.max_input_tokens, return_tensors="pt",
         )
         targets = tokenizer(
-            text_target=[r["target"] for r in rows], padding=True,
+            text_target=[target_text(r, args.scenario_sentence) for r in rows], padding=True,
             truncation=True, max_length=args.max_target_tokens, return_tensors="pt",
         )
         targets["input_ids"][targets["attention_mask"] == 0] = -100
@@ -293,7 +323,8 @@ def main():
         "model": args.model,
         "requested_revision": args.revision,
         "resolved_revision": getattr(model.config, "_commit_hash", None),
-        "mode": args.mode, "seed": args.seed,
+        "mode": args.mode, "seed": args.seed, "scenario_sentence": args.scenario_sentence,
+        "sampling_alpha": args.sampling_alpha, "sampling": sampling,
         "steps": args.steps, "steps_run": steps_run, "stopped_early": stopped_early,
         "batch_size": args.batch_size, "lr": args.lr,
         "training_records_used": len(train),
