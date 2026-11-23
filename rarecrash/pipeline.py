@@ -118,6 +118,32 @@ def is_rare_count(n):
     return RARE_MIN <= n <= RARE_MAX
 
 
+CONDITION_FIELDS = ("surface", "lighting", "vehicles", "primary_cause")
+
+
+def parse_conditions(text):
+    """Read the four condition fields back out of a narrative.
+
+    Uses the same patterns and value maps as extraction, so it can score
+    generated text and retrieved text the same way. A field that is missing
+    or outside the schema is None.
+    """
+    parsed = dict.fromkeys(CONDITION_FIELDS)
+    road = ROAD_RE.search(text)
+    if road:
+        raw_surface, raw_lighting = (s.strip() for s in road.groups())
+        parsed["surface"] = SURFACES.get(raw_surface)
+        parsed["lighting"] = LIGHTING.get(raw_lighting)
+    vehicle = VEHICLE_RE.search(text)
+    if vehicle and int(vehicle.group(1)) >= 1:
+        count = int(vehicle.group(1))
+        parsed["vehicles"] = "3+" if count >= 3 else str(count)
+    cause = CAUSE_RE.search(text)
+    if cause:
+        parsed["primary_cause"] = cause.group(1).strip()
+    return parsed
+
+
 def write_json(path, obj):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
