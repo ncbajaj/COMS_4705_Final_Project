@@ -1,0 +1,119 @@
+{
+  "manifest": {
+    "source": "https://zenodo.org/records/16896765/files/Puw242/SafeTraffic-v0.1.0.zip?download=1",
+    "archive_sha256": "9641f5d782048c86cde46a788ff0fae6e6ff0227039652c251a65789200ebbc3",
+    "original_illinois_ids": 14814,
+    "retained": 12043,
+    "excluded": {
+      "outside_schema": 500,
+      "unknown_cause": 2185,
+      "duplicate_target": 86
+    },
+    "split_counts": {
+      "train": 9625,
+      "test": 1199,
+      "dev": 1219
+    },
+    "split_rule": "SHA256('rarecrash-v1:' + Illinois crash ID), 80/10/10",
+    "target_rule": "from road-surface sentence up to first driver-description marker",
+    "processed_sha256": {
+      "train": "d9b2abdce36cf7726c1b6337de1c9df6504acbe61ba2abd354b74ea6bdb5a97d",
+      "dev": "913aa366c908480f17935e8067153a70f8abc9ef070e24596d6889542036961a",
+      "test": "7f4ce2a2dd907a2352415b43bf4ea96aae1027de43f4e2f506d935050595ebf4"
+    }
+  },
+  "audit": {
+    "train": 9625,
+    "dev": 1219,
+    "test_count_unopened": 1199,
+    "schema_values": {
+      "surface": [
+        "dry",
+        "ice",
+        "snow/slush",
+        "wet"
+      ],
+      "lighting": [
+        "dark",
+        "dark_lighted",
+        "dawn",
+        "daylight",
+        "dusk"
+      ],
+      "vehicles": [
+        "1",
+        "2",
+        "3+"
+      ],
+      "primary_cause_categories": 36
+    },
+    "train_condition_combinations": 640,
+    "rare_train_combinations_5_to_20": 156,
+    "rare_train_examples_5_to_20": 1585,
+    "dev_examples_matching_rare_train_combinations": 196,
+    "train_exact_target_duplicate_rows": 0,
+    "train_original_release_splits": {
+      "train": 1334,
+      "val": 4166,
+      "test": 4125
+    },
+    "warning": "Collision type is metadata; most source narratives do not explicitly state its label."
+  },
+  "retrieval_baseline": {
+    "all": {
+      "dev_examples": 1219,
+      "exact_condition_retrieval_coverage": 0.977850697292863,
+      "exact_matches": 1192,
+      "distinct_retrieved_texts": 253,
+      "distinct_condition_tuples_with_exact_match": 253,
+      "condition_adherence_of_exact_matches": 1.0,
+      "note": "Adherence here follows from the source metadata, not an independent text parser."
+    },
+    "rare_5_to_20": {
+      "dev_examples": 196,
+      "exact_condition_retrieval_coverage": 1.0,
+      "exact_matches": 196,
+      "distinct_retrieved_texts": 103,
+      "distinct_condition_tuples_with_exact_match": 103,
+      "condition_adherence_of_exact_matches": 1.0,
+      "note": "Adherence here follows from the source metadata, not an independent text parser."
+    }
+  },
+  "pilot_50_step": {
+    "uniform": {
+      "model": "google/flan-t5-small",
+      "requested_revision": "0fc9ddf78a1e988dac52e2dac162b0ede4fd74ab",
+      "resolved_revision": "0fc9ddf78a1e988dac52e2dac162b0ede4fd74ab",
+      "mode": "uniform",
+      "seed": 4705,
+      "steps": 50,
+      "batch_size": 2,
+      "training_records_used": 256,
+      "dev_records_used": 16,
+      "device": "mps",
+      "torch": "2.9.0",
+      "transformers": "4.57.1",
+      "first_train_loss": 3.301281213760376,
+      "last_train_loss": 0.4391864240169525,
+      "mean_teacher_forced_dev_loss": 0.4252723762765527
+    },
+    "weighted": {
+      "model": "google/flan-t5-small",
+      "requested_revision": "0fc9ddf78a1e988dac52e2dac162b0ede4fd74ab",
+      "resolved_revision": "0fc9ddf78a1e988dac52e2dac162b0ede4fd74ab",
+      "mode": "frequency-aware",
+      "seed": 4705,
+      "steps": 50,
+      "batch_size": 2,
+      "training_records_used": 256,
+      "dev_records_used": 16,
+      "device": "mps",
+      "torch": "2.9.0",
+      "transformers": "4.57.1",
+      "first_train_loss": 3.680891275405884,
+      "last_train_loss": 0.29717180132865906,
+      "mean_teacher_forced_dev_loss": 0.4192588129080832
+    }
+  },
+  "note": "Pilot losses are plumbing checks on only 256 training and 16 development examples; they do not establish sampler superiority."
+}
