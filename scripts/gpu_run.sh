@@ -16,8 +16,9 @@
 #   STEPS=4000 BF16=0 bash scripts/gpu_run.sh
 #
 # Each finished stage is skipped on a rerun (its run.json or summary.json
-# exists), so after a crash the script can simply be started again. A training
-# stage that crashed restarts from step 0; delete its directory first.
+# exists), so after a crash or disconnect the script can simply be started
+# again. Training saves its full state at every evaluation and a rerun
+# continues an unfinished training run from its last evaluation.
 # The test split is never read.
 
 set -euo pipefail
@@ -35,7 +36,8 @@ EVAL_EVERY=${EVAL_EVERY:-250}
 TRAIN_SEEDS=${TRAIN_SEEDS:-"4705 4706 4707"}  # one training run per mode per seed
 ALPHA=${ALPHA:-0.5}           # frequency-aware weight = count ** -ALPHA
 SAMPLE_SEEDS=${SAMPLE_SEEDS:-"1 2 3"}
-BF16=${BF16:-auto}            # auto: on if the GPU supports bfloat16
+BF16=${BF16:-auto}            # auto: on for GPUs with native bfloat16 (A100, L4, H100)
+USE_VENV=${USE_VENV:-1}       # 0: install into $PYTHON's own environment (Colab)
 # Smoke-test overrides only; leave at their defaults for the real run.
 REQUIRE_CUDA=${REQUIRE_CUDA:-1}
 DEV_LIMIT=${DEV_LIMIT:-0}     # dev records scored during training; 0 = all
@@ -45,16 +47,23 @@ DIVERSITY_LIMIT=${DIVERSITY_LIMIT:-0}  # rare tuples in the diversity stage; 0 =
 log() { printf '\n== %s  %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
 log "environment"
-if [ ! -x .venv/bin/python ]; then
-    "$PYTHON" -m venv .venv
-    .venv/bin/python -m pip install -q --upgrade pip
-    .venv/bin/python -m pip install -q -r requirements-train.txt
+if [ "$USE_VENV" = 1 ]; then
+    if [ ! -x .venv/bin/python ]; then
+        "$PYTHON" -m venv .venv
+        .venv/bin/python -m pip install -q --upgrade pip
+        .venv/bin/python -m pip install -q -r requirements-train.txt
+    fi
+    PY=.venv/bin/python
+else
+    "$PYTHON" -m pip install -q -r requirements-train.txt
+    PY=$PYTHON
 fi
-PY=.venv/bin/python
 "$PY" -c "import torch, sys; ok = torch.cuda.is_available(); print('CUDA:', ok, torch.cuda.get_device_name(0) if ok else ''); sys.exit(0 if ok or sys.argv[1] == '0' else 'No CUDA GPU visible; this script is for the GPU run.')" "$REQUIRE_CUDA"
 if command -v nvidia-smi >/dev/null; then nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv; fi
 if [ "$BF16" = auto ]; then
-    BF16=$("$PY" -c "import torch; print(int(torch.cuda.is_available() and torch.cuda.is_bf16_supported()))")
+    # Compute capability 8.0+ has native bfloat16; older GPUs such as the T4
+    # report support but emulate it slowly.
+    BF16=$("$PY" -c "import torch; print(int(torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8))")
 fi
 BF16_FLAG=(); if [ "$BF16" = 1 ]; then BF16_FLAG=(--bf16); fi
 echo "bf16: $BF16"
@@ -92,8 +101,8 @@ for SEED in $TRAIN_SEEDS; do
             ${EXTRA[@]+"${EXTRA[@]}"} \
             --limit 0 --steps "$STEPS" --batch-size "$BATCH" --lr "$LR" --seed "$SEED" \
             --eval-every "$EVAL_EVERY" --dev-limit "$DEV_LIMIT" --eval-batch-size 32 --select-on dev \
-            --save-model ${BF16_FLAG[@]+"${BF16_FLAG[@]}"} ${SC_FLAG[@]+"${SC_FLAG[@]}"} \
-            2>&1 | tee "$DIR.log"
+            --save-model --resume ${BF16_FLAG[@]+"${BF16_FLAG[@]}"} ${SC_FLAG[@]+"${SC_FLAG[@]}"} \
+            2>&1 | tee -a "$DIR.log"
     done
 done
 

@@ -124,6 +124,42 @@ def save_checkpoint(model, tokenizer, path):
     tmp.rename(path)
 
 
+RESUME_FILE = "resume.pt"
+# Settings that must match for a resumed run to continue the same experiment.
+RESUME_KEYS = ("data", "model", "revision", "mode", "sampling_alpha", "steps", "batch_size",
+               "limit", "dev_limit", "eval_every", "select_on", "patience", "min_delta", "seed",
+               "lr", "max_input_tokens", "max_target_tokens", "save_model", "scenario_sentence",
+               "bf16")
+
+
+def rng_states(torch, np, rng):
+    states = {"python": random.getstate(), "numpy": np.random.get_state(),
+              "sampler": rng.getstate(), "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        states["cuda"] = torch.cuda.get_rng_state_all()
+    if torch.backends.mps.is_available():
+        states["mps"] = torch.mps.get_rng_state()
+    return states
+
+
+def set_rng_states(torch, np, rng, states):
+    random.setstate(states["python"])
+    np.random.set_state(states["numpy"])
+    rng.setstate(states["sampler"])
+    torch.set_rng_state(states["torch"])
+    if "cuda" in states and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(states["cuda"])
+    if "mps" in states and torch.backends.mps.is_available():
+        torch.mps.set_rng_state(states["mps"])
+
+
+def save_resume_state(torch, path, state):
+    """Atomic write: a disconnect during the save leaves the previous file intact."""
+    tmp = Path(str(path) + ".tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
 def choose_device(torch, requested):
     if requested != "auto":
         return requested
@@ -168,6 +204,11 @@ def main():
                         help="add the collision-type scenario sentence to targets (see scenario.py)")
     parser.add_argument("--bf16", action="store_true",
                         help="bfloat16 autocast on CUDA (Ampere or newer); weights stay fp32")
+    parser.add_argument("--resume", action="store_true",
+                        help="save full training state at every evaluation and continue from "
+                             f"OUT/{RESUME_FILE} if it exists")
+    # Test hook: exit right after the evaluation at this step, as a disconnect would.
+    parser.add_argument("--crash-after-step", type=int, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.steps < 1 or args.batch_size < 1 or args.eval_batch_size < 1:
         parser.error("steps, batch-size and eval-batch-size must be positive")
@@ -217,6 +258,8 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     started = time.time()
+    resume_path = out / RESUME_FILE
+    settings = {k: getattr(args, k) for k in RESUME_KEYS}
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model, revision=args.revision).to(device)
@@ -263,11 +306,32 @@ def main():
     best_state = None
     stopped_early = False
     steps_run = 0
-
     first_loss = None
     last_loss = None
+    start_step = 0
+    resumed_from = None
+
+    if args.resume and resume_path.exists():
+        state = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if state["settings"] != settings:
+            changed = sorted(k for k in settings if state["settings"].get(k) != settings[k])
+            raise SystemExit(f"{resume_path} was written with different settings ({changed}); "
+                             "delete it or rerun with the original settings")
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        set_rng_states(torch, np, rng, state["rng"])
+        history, first_loss, last_loss = state["history"], state["first_loss"], state["last_loss"]
+        selector.__dict__.update(state["selector"])
+        best_state = state.get("best_state")
+        if best_state is None:  # with --save-model the best weights live in OUT/model
+            best_state = AutoModelForSeq2SeqLM.from_pretrained(out / "model").state_dict()
+        start_step = steps_run = resumed_from = state["step"]
+        started -= state["elapsed_seconds"]
+        print(f"resumed from step {start_step} ({resume_path})", flush=True)
+        del state
+
     model.train()
-    for step in range(args.steps):
+    for step in range(start_step, args.steps):
         if args.mode == "frequency-aware":
             rows = rng.choices(train, weights=weights, k=args.batch_size)
         else:
@@ -300,6 +364,18 @@ def main():
                                                "dev_history": history})
             fmt = " ".join(f"{k}_loss={v:.4f}" for k, v in scores.items() if v is not None)
             print(f"eval step={steps_run} {fmt}{' *best*' if improved else ''}", flush=True)
+            if args.resume and steps_run < args.steps:
+                save_resume_state(torch, resume_path, {
+                    "settings": settings, "step": steps_run,
+                    "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                    "rng": rng_states(torch, np, rng), "history": history,
+                    "first_loss": first_loss, "last_loss": last_loss,
+                    "selector": dict(selector.__dict__),
+                    "best_state": None if args.save_model else best_state,
+                    "elapsed_seconds": time.time() - started,
+                })
+            if args.crash_after_step and steps_run == args.crash_after_step:
+                raise SystemExit(f"simulated crash after step {steps_run}")
             if selector.should_stop:
                 stopped_early = True
                 print(f"early stop: {args.patience} evals without improvement", flush=True)
@@ -326,6 +402,7 @@ def main():
         "mode": args.mode, "seed": args.seed, "scenario_sentence": args.scenario_sentence,
         "sampling_alpha": args.sampling_alpha, "sampling": sampling,
         "steps": args.steps, "steps_run": steps_run, "stopped_early": stopped_early,
+        "resumed_from_step": resumed_from,
         "batch_size": args.batch_size, "lr": args.lr,
         "training_records_used": len(train),
         "dev_records_used": {k: len(v) for k, v in subsets.items()},
@@ -343,6 +420,7 @@ def main():
         "warning": "Pilot loss is a plumbing check, not a comparable model-quality result.",
     }
     write_json(out / "run.json", result)
+    resume_path.unlink(missing_ok=True)  # the finished run no longer needs it
     # The best checkpoint is already in OUT/model when --save-model is set.
     print(json.dumps({k: v for k, v in result.items()
                       if k not in ("generation_examples", "dev_history")}, indent=2))
