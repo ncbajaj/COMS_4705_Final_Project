@@ -110,6 +110,14 @@ def condition_key(record):
     return tuple(record[k] for k in ("surface", "lighting", "vehicles", "primary_cause"))
 
 
+# Provisional rare-condition range: training examples per condition tuple.
+RARE_MIN, RARE_MAX = 5, 20
+
+
+def is_rare_count(n):
+    return RARE_MIN <= n <= RARE_MAX
+
+
 def write_json(path, obj):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -175,7 +183,7 @@ def audit(args):
     train, dev = (load_jsonl(base / f"{s}.jsonl") for s in ("train", "dev"))
     test_count = sum(1 for _ in (base / "test.jsonl").open(encoding="utf-8"))
     counts = Counter(condition_key(r) for r in train)
-    rare = {key for key, n in counts.items() if 5 <= n <= 20}
+    rare = {key for key, n in counts.items() if is_rare_count(n)}
     dev_rare = [r for r in dev if condition_key(r) in rare]
     exact_target_duplicates = sum(n - 1 for n in Counter(r["target"] for r in train).values() if n > 1)
     report = {
@@ -205,7 +213,7 @@ def retrieve(args):
     for record in train:
         pool[condition_key(record)].append(record)
     train_counts = {key: len(rows) for key, rows in pool.items()}
-    groups = {"all": dev, "rare_5_to_20": [r for r in dev if 5 <= train_counts.get(condition_key(r), 0) <= 20]}
+    groups = {"all": dev, "rare_5_to_20": [r for r in dev if is_rare_count(train_counts.get(condition_key(r), 0))]}
     report = {}
     for name, examples in groups.items():
         exact = [r for r in examples if condition_key(r) in pool]
