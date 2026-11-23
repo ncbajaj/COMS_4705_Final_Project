@@ -8,16 +8,23 @@ Checkpoint selection: with --eval-every N the model is scored on development
 data every N steps (and after the last step). The checkpoint with the lowest
 mean teacher-forced dev loss on the --select-on subset is kept in memory,
 restored before the final evaluation, and is the one written by --save-model.
+With --save-model the best checkpoint is also written to OUT/model each time
+it improves, and OUT/progress.json is updated after every evaluation, so a
+crashed run keeps its best checkpoint and its evaluation history.
 --patience stops training after that many evaluations without improvement.
 """
 
 import argparse
 from collections import Counter
+import contextlib
 import json
 import os
 from pathlib import Path
 import random
+import shutil
+import subprocess
 import sys
+import time
 
 from .pipeline import condition_key, is_rare_count, load_jsonl, write_json
 
@@ -75,6 +82,31 @@ def eval_steps(total_steps, every):
     return steps
 
 
+def git_state():
+    """Commit and dirty flag of the repository holding this code, if any."""
+    root = Path(__file__).resolve().parent.parent
+
+    def git(*cmd):
+        return subprocess.run(["git", "-C", str(root), *cmd], capture_output=True,
+                              text=True, check=True).stdout.strip()
+    try:
+        return {"commit": git("rev-parse", "HEAD"),
+                "dirty": bool(git("status", "--porcelain", "--untracked-files=no"))}
+    except (OSError, subprocess.CalledProcessError):
+        return {"commit": None, "dirty": None}
+
+
+def save_checkpoint(model, tokenizer, path):
+    """Write to a temporary directory first so a crash never leaves a half-written model."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    model.save_pretrained(tmp)
+    tokenizer.save_pretrained(tmp)
+    shutil.rmtree(path, ignore_errors=True)
+    tmp.rename(path)
+
+
 def choose_device(torch, requested):
     if requested != "auto":
         return requested
@@ -112,6 +144,8 @@ def main():
     parser.add_argument("--max-target-tokens", type=int, default=192)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
     parser.add_argument("--save-model", action="store_true")
+    parser.add_argument("--bf16", action="store_true",
+                        help="bfloat16 autocast on CUDA (Ampere or newer); weights stay fp32")
     args = parser.parse_args()
     if args.steps < 1 or args.batch_size < 1 or args.eval_batch_size < 1:
         parser.error("steps, batch-size and eval-batch-size must be positive")
@@ -146,6 +180,13 @@ def main():
         raise ValueError(f"No development records in selection subset {args.select_on!r}")
     weights = [1 / max(1, full_train_counts[condition_key(r)]) ** 0.5 for r in train]
     device = choose_device(torch, args.device)
+    if args.bf16 and not (device == "cuda" and torch.cuda.is_bf16_supported()):
+        parser.error("--bf16 needs a CUDA GPU with bfloat16 support")
+    autocast = ((lambda: torch.autocast("cuda", dtype=torch.bfloat16)) if args.bf16
+                else contextlib.nullcontext)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    started = time.time()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
     model = AutoModelForSeq2SeqLM.from_pretrained(args.model, revision=args.revision).to(device)
@@ -168,8 +209,9 @@ def main():
         losses = []
         for i in range(0, len(rows), args.eval_batch_size):
             inputs, labels = batch_tensors(rows[i:i + args.eval_batch_size])
-            logits = model(**inputs, labels=labels).logits
-            token_loss = F.cross_entropy(logits.transpose(1, 2), labels,
+            with autocast():
+                logits = model(**inputs, labels=labels).logits
+            token_loss = F.cross_entropy(logits.float().transpose(1, 2), labels,
                                          ignore_index=-100, reduction="none")
             mask = labels != -100
             losses += ((token_loss * mask).sum(1) / mask.sum(1)).tolist()
@@ -202,7 +244,8 @@ def main():
             rows = rng.choices(train, k=args.batch_size)
         inputs, labels = batch_tensors(rows)
         optimizer.zero_grad(set_to_none=True)
-        loss = model(**inputs, labels=labels).loss
+        with autocast():
+            loss = model(**inputs, labels=labels).loss
         loss.backward()
         optimizer.step()
         last_loss = float(loss.detach().cpu())
@@ -218,8 +261,13 @@ def main():
                 # Kept on CPU so selection does not double accelerator memory.
                 best_state = {k: v.detach().to("cpu", copy=True)
                               for k, v in model.state_dict().items()}
+                if args.save_model:
+                    save_checkpoint(model, tokenizer, out / "model")
             history.append({"step": steps_run, "train_loss": last_loss,
-                            **{f"{k}_loss": v for k, v in scores.items()}, "best": improved})
+                            **{f"{k}_loss": v for k, v in scores.items()}, "best": improved,
+                            "elapsed_seconds": round(time.time() - started, 1)})
+            write_json(out / "progress.json", {"best_step": selector.best_step,
+                                               "dev_history": history})
             fmt = " ".join(f"{k}_loss={v:.4f}" for k, v in scores.items() if v is not None)
             print(f"eval step={steps_run} {fmt}{' *best*' if improved else ''}", flush=True)
             if selector.should_stop:
@@ -240,8 +288,6 @@ def main():
             examples.append({"id": row["id"], "prompt": prompt(row),
                              "generated": tokenizer.decode(tokens[0], skip_special_tokens=True)})
 
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
     result = {
         "status": "pilot, not final evaluation" if args.limit else "training run",
         "model": args.model,
@@ -252,7 +298,9 @@ def main():
         "batch_size": args.batch_size, "lr": args.lr,
         "training_records_used": len(train),
         "dev_records_used": {k: len(v) for k, v in subsets.items()},
-        "device": device, "torch": torch.__version__, "transformers": transformers.__version__,
+        "device": device, "bf16": args.bf16, "git": git_state(),
+        "elapsed_seconds": round(time.time() - started, 1),
+        "torch": torch.__version__, "transformers": transformers.__version__,
         "first_train_loss": first_loss, "last_train_loss": last_loss,
         "selection": {"select_on": args.select_on, "eval_every": args.eval_every,
                       "patience": args.patience, "min_delta": args.min_delta,
@@ -264,9 +312,7 @@ def main():
         "warning": "Pilot loss is a plumbing check, not a comparable model-quality result.",
     }
     write_json(out / "run.json", result)
-    if args.save_model:
-        model.save_pretrained(out / "model")
-        tokenizer.save_pretrained(out / "model")
+    # The best checkpoint is already in OUT/model when --save-model is set.
     print(json.dumps({k: v for k, v in result.items()
                       if k not in ("generation_examples", "dev_history")}, indent=2))
 

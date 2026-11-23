@@ -12,6 +12,9 @@ Both systems are scored with the same metrics:
 Only the development split is read. The test split stays unopened.
 
     python -m rarecrash.evaluate --data data/processed --model runs/pilot-select/model --out runs/dev-eval
+
+--model may also be a Hugging Face model ID with --revision, which evaluates
+the untuned model as a baseline.
 """
 
 import argparse
@@ -131,8 +134,8 @@ def generate(args, records):
 
     torch.manual_seed(args.seed)
     device = choose_device(torch, args.device)
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.model).to(device).eval()
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision)
+    model = AutoModelForSeq2SeqLM.from_pretrained(args.model, revision=args.revision).to(device).eval()
     settings = {"max_new_tokens": args.max_new_tokens}
     if args.decoding == "sample":
         settings.update(do_sample=True, top_p=args.top_p, temperature=args.temperature)
@@ -148,7 +151,9 @@ def generate(args, records):
             for r, text in zip(batch, tokenizer.batch_decode(generated, skip_special_tokens=True)):
                 outputs[r["id"]] = text
             print(f"generated {min(i + args.batch_size, len(records))}/{len(records)}", flush=True)
-    runtime = {"device": device, "torch": torch.__version__,
+    runtime = {"requested_revision": args.revision,
+               "resolved_revision": getattr(model.config, "_commit_hash", None),
+               "device": device, "torch": torch.__version__,
                "transformers": transformers.__version__, "generation": settings}
     return outputs, runtime
 
@@ -156,7 +161,10 @@ def generate(args, records):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True)
-    parser.add_argument("--model", required=True, help="directory written by train --save-model")
+    parser.add_argument("--model", required=True,
+                        help="directory written by train --save-model, or a Hugging Face model ID")
+    parser.add_argument("--revision", default=None,
+                        help="Hugging Face revision; pin a commit hash for an untuned baseline")
     parser.add_argument("--out", required=True)
     parser.add_argument("--subset", choices=["all", "rare-dev"], default="all",
                         help="generate for every dev record, or only rare-tuple records")
@@ -205,11 +213,11 @@ def main():
                     "output": row["output"], "reference": record["target"], **row["score"],
                 }) + "\n")
 
-    run_info = Path(args.model).parent / "run.json"
+    run_info = Path(args.model).parent / "run.json" if Path(args.model).is_dir() else None
     summary = {
         "status": "development evaluation; test split not read",
         "model": str(args.model),
-        "training_run": json.loads(run_info.read_text()) if run_info.exists() else None,
+        "training_run": json.loads(run_info.read_text()) if run_info and run_info.exists() else None,
         "subset": args.subset, "limit": args.limit, "seed": args.seed,
         **runtime,
         "results": {
